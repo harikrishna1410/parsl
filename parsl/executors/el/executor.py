@@ -15,6 +15,7 @@ try:
     from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
     from ensemble_launcher.config.mpi_config import MPIConfig
     from ensemble_launcher.ensemble import Task
+    from ensemble_launcher.helper_functions import get_nodes
     from ensemble_launcher.orchestrator import ClusterClient
 except ImportError:
     _el_enabled = False
@@ -39,8 +40,10 @@ class EnsembleExecutor(ParslExecutor):
     @typeguard.typechecked
     def __init__(
         self,
-        cpus: List[int],
+        cpus: List[int] = list(range(os.cpu_count())),
         gpus: List[Union[str, int]] = [],
+        client_only: False = False,
+        node_id: str = "global",
         child_executor_name: str = "async_mpi",
         task_executor_name: Union[str, List[str]] = "async_processpool",
         comm_name: str = "async_zmq",
@@ -60,6 +63,9 @@ class EnsembleExecutor(ParslExecutor):
         task_flush_interval: float = 0.5,
         nodes: Optional[List[str]] = None,
         label: str = "EnsembleExecutor",
+        children_scheduler_policy: str = "fixed_leafs_children_policy",
+        leaf_nodes: Optional[int] = None,
+        nchildren: Optional[int] = None,
     ):
         if not _el_enabled:
             raise OptionalModuleMissing(
@@ -70,13 +76,17 @@ class EnsembleExecutor(ParslExecutor):
         super().__init__()
         self.label = label
 
+        # system config
         self._cpus = cpus
         self._gpus = gpus
 
+        # Launcher config options
         self._child_executor_name = child_executor_name
         self._task_executor_name = task_executor_name
         self._comm_name = comm_name
         self._nlevels = nlevels
+        self._leaf_nodes = leaf_nodes if leaf_nodes is not None else len(get_nodes())
+        self._nchildren = nchildren if nchildren is not None else len(get_nodes())
         self._report_interval = report_interval
         self._return_stdout = return_stdout
         self._worker_logs = worker_logs
@@ -91,6 +101,8 @@ class EnsembleExecutor(ParslExecutor):
         self._checkpoint_timeout = checkpoint_timeout
         self._task_buffer_size = task_buffer_size
         self._task_flush_interval = task_flush_interval
+        self._client_only = client_only
+        self._node_id = node_id
 
         self._nodes = nodes
 
@@ -104,50 +116,55 @@ class EnsembleExecutor(ParslExecutor):
         else:
             self._checkpoint_dir = os.path.join(self.run_dir, self.label, "checkpoints")
 
-        sys_config = SystemConfig(
-            name="parsl-el",
-            cpus=self._cpus,
-            gpus=self._gpus,
-            ncpus=len(self._cpus),
-            ngpus=len(self._gpus),
-        )
+        if not self._client_only:
+            sys_config = SystemConfig(
+                name="parsl-el",
+                cpus=self._cpus,
+                gpus=self._gpus,
+                ncpus=len(self._cpus),
+                ngpus=len(self._gpus),
+            )
 
-        launcher_kwargs: Dict[str, Any] = dict(
-            child_executor_name=self._child_executor_name,
-            task_executor_name=self._task_executor_name,
-            comm_name=self._comm_name,
-            policy_config=PolicyConfig(nlevels=self._nlevels),
-            report_interval=self._report_interval,
-            return_stdout=self._return_stdout,
-            worker_logs=self._worker_logs,
-            master_logs=self._master_logs,
-            enable_workstealing=self._enable_workstealing,
-            gpu_selector=self._gpu_selector,
-            overload_orchestrator_core=self._overload_orchestrator_core,
-            cluster=True,
-            checkpoint_dir=self._checkpoint_dir,
-            log_dir=os.path.join(self.run_dir, self.label, "logs"),
-        )
-        if self._mpi_flavor is not None:
-            launcher_kwargs["mpi_config"] = MPIConfig(flavor=self._mpi_flavor)
+            launcher_kwargs: Dict[str, Any] = dict(
+                child_executor_name=self._child_executor_name,
+                task_executor_name=self._task_executor_name,
+                comm_name=self._comm_name,
+                policy_config=PolicyConfig(
+                    nlevels=self._nlevels,
+                    nchildren=self._nchildren,
+                    leaf_nodes=self._leaf_nodes,
+                ),
+                report_interval=self._report_interval,
+                return_stdout=self._return_stdout,
+                worker_logs=self._worker_logs,
+                master_logs=self._master_logs,
+                enable_workstealing=self._enable_workstealing,
+                gpu_selector=self._gpu_selector,
+                overload_orchestrator_core=self._overload_orchestrator_core,
+                cluster=True,
+                checkpoint_dir=self._checkpoint_dir,
+                log_dir=os.path.join(self.run_dir, self.label, "logs"),
+            )
+            if self._mpi_flavor is not None:
+                launcher_kwargs["mpi_config"] = MPIConfig(flavor=self._mpi_flavor)
 
-        launcher_config = LauncherConfig(**launcher_kwargs)
+            launcher_config = LauncherConfig(**launcher_kwargs)
 
-        self._el = EnsembleLauncher(
-            ensemble_file={},
-            system_config=sys_config,
-            launcher_config=launcher_config,
-            Nodes=self._nodes,
-        )
-        self._el.start()
-        logger.info(
-            "EnsembleLauncher started (checkpoint_dir=%s)", self._checkpoint_dir
-        )
+            self._el = EnsembleLauncher(
+                ensemble_file={},
+                system_config=sys_config,
+                launcher_config=launcher_config,
+                Nodes=self._nodes,
+            )
+            self._el.start()
+            logger.info(
+                "EnsembleLauncher started (checkpoint_dir=%s)", self._checkpoint_dir
+            )
 
         try:
             self._client = ClusterClient(
                 checkpoint_dir=self._checkpoint_dir,
-                node_id="global",
+                node_id=self._node_id,
                 n_workers=self._n_workers,
                 checkpoint_timeout=self._checkpoint_timeout,
                 task_buffer_size=self._task_buffer_size,
