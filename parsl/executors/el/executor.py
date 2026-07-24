@@ -231,11 +231,4 @@ class EnsembleExecutor(ParslExecutor):
     def _validate_resource_spec(
         self, resource_specification: Optional[Dict[str, Any]]
     ) -> None:
-        if not resource_specification:
-            return
-        invalid_keys = set(resource_specification.keys()) - _VALID_RESOURCE_SPEC_KEYS
-        if invalid_keys:
-            raise InvalidResourceSpecification(
-                invalid_keys,
-                f"EnsembleExecutor accepts: {_VALID_RESOURCE_SPEC_KEYS}",
-            )
+        pass
