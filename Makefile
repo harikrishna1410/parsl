@@ -84,6 +84,11 @@ radical_local_test:  ## Run the Radical local tests (-m radical --config local)
 	pytest parsl/tests/ -k "not cleannet and not issue3328 and not executor_supports_std_stream_tuples" --config parsl/tests/configs/local_radical.py --random-order --durations 10
 	pytest parsl/tests/ -m "radical" --config local --random-order --durations 10
 
+.PHONY: el_local_test
+el_local_test: ## run all tests with htex_local config (--config .../htex_local.py)
+	pip3 install .
+	pytest parsl/tests/ -k "not cleannet" --config parsl/tests/configs/local_el.py --random-order --durations 10
+
 .PHONY: config_local_test
 config_local_test:  ## run the config-local tests (--config local)
 	pip3 install ".[monitoring,visualization,proxystore,kubernetes]"
