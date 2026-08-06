@@ -1,15 +1,13 @@
-import json
 import logging
 import os
 import threading
 import uuid
 from concurrent.futures import Future
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Callable
 
 import typeguard
 
 from parsl.errors import OptionalModuleMissing
-from parsl.executors.errors import InvalidResourceSpecification
 from parsl.executors.status_handling import BlockProviderExecutor
 from parsl.providers.base import ExecutionProvider
 
@@ -28,7 +26,7 @@ else:
 
 logger = logging.getLogger(__name__)
 
-_VALID_RESOURCE_SPEC_KEYS: Set[str] = {
+_VALID_RESOURCE_SPEC_KEYS: set[str] = {
     "ppn",
     "nnodes",
     "ngpus_per_process",
@@ -66,12 +64,12 @@ class EnsembleExecutor(BlockProviderExecutor):
     @typeguard.typechecked
     def __init__(
         self,
-        cpus: List[int] = list(range(os.cpu_count())),
-        gpus: List[Union[str, int]] = [],
+        cpus: list[int] | None = None,
+        gpus: list[str | int] | None = None,
         client_only: bool = False,
         node_id: str = "global",
         child_executor_name: str = "async_mpi",
-        task_executor_name: Union[str, List[str]] = "async_processpool",
+        task_executor_name: str | list[str] = "async_processpool",
         comm_name: str = "async_zmq",
         nlevels: int = 0,
         report_interval: float = 10.0,
@@ -79,22 +77,24 @@ class EnsembleExecutor(BlockProviderExecutor):
         worker_logs: bool = False,
         master_logs: bool = False,
         enable_workstealing: bool = False,
-        mpi_flavor: Optional[str] = None,
+        mpi_flavor: str | None = None,
         gpu_selector: str = "ZE_AFFINITY_MASK",
         overload_orchestrator_core: bool = True,
-        checkpoint_dir: Optional[str] = None,
+        checkpoint_dir: str | None = None,
         n_workers: int = 1,
         checkpoint_timeout: float = 300.0,
         task_buffer_size: int = 10000,
         task_flush_interval: float = 0.5,
-        nodes: Optional[List[str]] = None,
+        nodes: list[str] | None = None,
         label: str = "EnsembleExecutor",
         children_scheduler_policy: str = "fixed_leafs_children_policy",
-        leaf_nodes: Optional[int] = None,
-        nchildren: Optional[int] = None,
-        provider: Optional[ExecutionProvider] = None,
-        block_error_handler: Union[bool, Callable] = True,
+        leaf_nodes: int | None = None,
+        nchildren: int | None = None,
+        provider: ExecutionProvider | None = None,
+        block_error_handler: bool | Callable = True,
     ):
+        cpus = cpus or list(range(os.cpu_count()))
+        gpus = gpus or []
         if not _el_enabled:
             raise OptionalModuleMissing(
                 ["ensemble_launcher"],
@@ -153,10 +153,10 @@ class EnsembleExecutor(BlockProviderExecutor):
         self._node_id = node_id
         self._nodes = nodes
 
-        self._el: Optional[EnsembleLauncher] = None
-        self._client: Optional[ClusterClient] = None
-        self._checkpoint_dir: Optional[str] = None
-        self._client_ready: Optional[threading.Event] = None
+        self._el: EnsembleLauncher | None = None
+        self._client: ClusterClient | None = None
+        self._checkpoint_dir: str | None = None
+        self._client_ready: threading.Event | None = None
 
     def start(self) -> None:
         super().start()
@@ -193,26 +193,26 @@ class EnsembleExecutor(BlockProviderExecutor):
             ngpus=len(self._gpus),
         )
 
-        launcher_kwargs: Dict[str, Any] = dict(
-            child_executor_name=self._child_executor_name,
-            task_executor_name=self._task_executor_name,
-            comm_name=self._comm_name,
-            policy_config=PolicyConfig(
+        launcher_kwargs: dict[str, Any] = {
+            "child_executor_name": self._child_executor_name,
+            "task_executor_name": self._task_executor_name,
+            "comm_name": self._comm_name,
+            "policy_config": PolicyConfig(
                 nlevels=self._nlevels,
                 nchildren=self._nchildren,
                 leaf_nodes=self._leaf_nodes,
             ),
-            report_interval=self._report_interval,
-            return_stdout=self._return_stdout,
-            worker_logs=self._worker_logs,
-            master_logs=self._master_logs,
-            enable_workstealing=self._enable_workstealing,
-            gpu_selector=self._gpu_selector,
-            overload_orchestrator_core=self._overload_orchestrator_core,
-            cluster=True,
-            checkpoint_dir=self._checkpoint_dir,
-            log_dir=os.path.join(self.run_dir, self.label, "logs"),
-        )
+            "report_interval": self._report_interval,
+            "return_stdout": self._return_stdout,
+            "worker_logs": self._worker_logs,
+            "master_logs": self._master_logs,
+            "enable_workstealing": self._enable_workstealing,
+            "gpu_selector": self._gpu_selector,
+            "overload_orchestrator_core": self._overload_orchestrator_core,
+            "cluster": True,
+            "checkpoint_dir": self._checkpoint_dir,
+            "log_dir": os.path.join(self.run_dir, self.label, "logs"),
+        }
         if self._mpi_flavor is not None:
             launcher_kwargs["mpi_config"] = MPIConfig(flavor=self._mpi_flavor)
 
@@ -279,26 +279,26 @@ class EnsembleExecutor(BlockProviderExecutor):
             ngpus=len(self._gpus),
         )
 
-        launcher_kwargs: Dict[str, Any] = dict(
-            child_executor_name=self._child_executor_name,
-            task_executor_name=self._task_executor_name,
-            comm_name=self._comm_name,
-            policy_config=PolicyConfig(
+        launcher_kwargs: dict[str, Any] = {
+            "child_executor_name": self._child_executor_name,
+            "task_executor_name": self._task_executor_name,
+            "comm_name": self._comm_name,
+            "policy_config": PolicyConfig(
                 nlevels=self._nlevels,
                 nchildren=self._nchildren,
                 leaf_nodes=self._leaf_nodes,
             ),
-            report_interval=self._report_interval,
-            return_stdout=self._return_stdout,
-            worker_logs=self._worker_logs,
-            master_logs=self._master_logs,
-            enable_workstealing=self._enable_workstealing,
-            gpu_selector=self._gpu_selector,
-            overload_orchestrator_core=self._overload_orchestrator_core,
-            cluster=True,
-            checkpoint_dir=self._checkpoint_dir,
-            log_dir=os.path.join(self.run_dir, self.label, "logs"),
-        )
+            "report_interval": self._report_interval,
+            "return_stdout": self._return_stdout,
+            "worker_logs": self._worker_logs,
+            "master_logs": self._master_logs,
+            "enable_workstealing": self._enable_workstealing,
+            "gpu_selector": self._gpu_selector,
+            "overload_orchestrator_core": self._overload_orchestrator_core,
+            "cluster": True,
+            "checkpoint_dir": self._checkpoint_dir,
+            "log_dir": os.path.join(self.run_dir, self.label, "logs"),
+        }
         if self._mpi_flavor is not None:
             launcher_kwargs["mpi_config"] = MPIConfig(flavor=self._mpi_flavor)
 
@@ -329,7 +329,7 @@ class EnsembleExecutor(BlockProviderExecutor):
         return len(self._tasks)
 
     @property
-    def workers_per_node(self) -> Union[int, float]:
+    def workers_per_node(self) -> int | float:
         return 1
 
     @property
@@ -341,18 +341,17 @@ class EnsembleExecutor(BlockProviderExecutor):
     def submit(
         self,
         func: Callable,
-        resource_specification: Dict[str, Any],
+        resource_specification: dict[str, Any],
         *args: Any,
         **kwargs: Any,
     ) -> Future:
         if self.bad_state_is_set:
             raise self.executor_exception
 
-        if self._client_ready is not None:
-            if not self._client_ready.wait(timeout=self._checkpoint_timeout):
-                raise RuntimeError(
-                    "ClusterClient failed to connect within timeout"
-                )
+        if self._client_ready is not None and not self._client_ready.wait(
+            timeout=self._checkpoint_timeout
+        ):
+            raise RuntimeError("ClusterClient failed to connect within timeout")
 
         if self._client is None:
             raise RuntimeError("ClusterClient is not initialized")
@@ -412,6 +411,6 @@ class EnsembleExecutor(BlockProviderExecutor):
         return False
 
     def _validate_resource_spec(
-        self, resource_specification: Optional[Dict[str, Any]]
+        self, resource_specification: dict[str, Any] | None
     ) -> None:
         pass
