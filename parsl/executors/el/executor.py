@@ -219,7 +219,6 @@ class EnsembleExecutor(ParslExecutor):
         nchildren: int | None = None,
     ):
         cpus = cpus or list(range(os.cpu_count() or 1))
-	
         if gpus is None:
             gpus = [
                 d.strip() for d in os.getenv(gpu_selector, "").split(",") if d.strip()
