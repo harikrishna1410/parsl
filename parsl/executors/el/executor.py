@@ -113,8 +113,10 @@ class EnsembleExecutor(ParslExecutor):
         CPU core indices available for the orchestrator. Defaults to all
         cores reported by ``os.cpu_count()``.
     gpus : list[str | int] or None, optional
-        GPU device identifiers available for the orchestrator. Defaults to
-        an empty list.
+        GPU device identifiers available for the orchestrator. If ``None``
+        (default), the comma-separated device list is read from the
+        ``gpu_selector`` environment variable, and is empty when that
+        variable is unset. Pass ``[]`` to force no GPUs.
     client_only : bool, optional
         If ``True``, skip starting an orchestrator and only create a
         ``ClusterClient`` that connects to an existing one. Default is
@@ -216,8 +218,12 @@ class EnsembleExecutor(ParslExecutor):
         leaf_nodes: int | None = None,
         nchildren: int | None = None,
     ):
-        cpus = cpus or list(range(os.cpu_count()))
-        gpus = gpus or []
+        cpus = cpus or list(range(os.cpu_count() or 1))
+	
+        if gpus is None:
+            gpus = [
+                d.strip() for d in os.getenv(gpu_selector, "").split(",") if d.strip()
+            ]
         if not _el_enabled:
             raise OptionalModuleMissing(
                 ["ensemble_launcher"],
