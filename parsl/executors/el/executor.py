@@ -1,6 +1,5 @@
 import logging
 import os
-import threading
 import uuid
 from concurrent.futures import Future
 from typing import Any, Callable
@@ -8,8 +7,8 @@ from typing import Any, Callable
 import typeguard
 
 from parsl.errors import OptionalModuleMissing
-from parsl.executors.status_handling import BlockProviderExecutor
-from parsl.providers.base import ExecutionProvider
+from parsl.executors.base import ParslExecutor
+from parsl.executors.errors import InvalidResourceSpecification
 
 try:
     from ensemble_launcher import EnsembleLauncher
@@ -26,41 +25,72 @@ else:
 
 logger = logging.getLogger(__name__)
 
-_VALID_RESOURCE_SPEC_KEYS: set[str] = {
-    "ppn",
-    "nnodes",
-    "ngpus_per_process",
-    "cpu_affinity",
-    "gpu_affinity",
-    "env",
-    "run_dir",
+
+def _is_int(value: Any) -> bool:
+    """Return ``True`` for a real int; ``bool`` is rejected.
+
+    ``bool`` subclasses ``int`` in Python, but is never a meaningful
+    count or device index here, so ``True`` must not pass as ``1``.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_positive_int(value: Any) -> str | None:
+    if not _is_int(value) or value < 1:
+        return "a positive int"
+    return None
+
+
+def _check_ngpus_per_process(value: Any) -> str | None:
+    if not (_is_int(value) or isinstance(value, float)) or value < 0:
+        return "a non-negative int or float"
+    return None
+
+
+def _check_cpu_affinity(value: Any) -> str | None:
+    if not isinstance(value, list) or not all(_is_int(v) for v in value):
+        return "a list of int"
+    return None
+
+
+def _check_gpu_affinity(value: Any) -> str | None:
+    if not isinstance(value, list) or not all(
+        _is_int(v) or isinstance(v, str) for v in value
+    ):
+        return "a list of int or str"
+    return None
+
+
+def _check_env(value: Any) -> str | None:
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        return "a dict mapping str to str"
+    return None
+
+
+def _check_run_dir(value: Any) -> str | None:
+    if not isinstance(value, (str, os.PathLike)):
+        return "a str or os.PathLike"
+    return None
+
+
+# Maps each accepted resource specification key to a checker. A checker
+# returns None when the value is acceptable, or a description of what
+# was expected. The accepted types mirror the corresponding fields of
+# ``ensemble_launcher.ensemble.Task``.
+_RESOURCE_SPEC_VALIDATORS: dict[str, Callable[[Any], str | None]] = {
+    "ppn": _check_positive_int,
+    "nnodes": _check_positive_int,
+    "ngpus_per_process": _check_ngpus_per_process,
+    "cpu_affinity": _check_cpu_affinity,
+    "gpu_affinity": _check_gpu_affinity,
+    "env": _check_env,
+    "run_dir": _check_run_dir,
 }
 
-_LAUNCH_SCRIPT_TEMPLATE = """\
-import json
-import sys
 
-from ensemble_launcher import EnsembleLauncher
-from ensemble_launcher.config import LauncherConfig, SystemConfig
-
-with open(sys.argv[1]) as f:
-    sys_config = SystemConfig.model_validate(json.load(f))
-with open(sys.argv[2]) as f:
-    launcher_config = LauncherConfig.model_validate(json.load(f))
-
-nodes = sys.argv[3].split(",") if len(sys.argv) > 3 and sys.argv[3] else None
-
-el = EnsembleLauncher(
-    ensemble_file={{}},
-    system_config=sys_config,
-    launcher_config=launcher_config,
-    Nodes=nodes,
-)
-el.run()
-"""
-
-
-class EnsembleExecutor(BlockProviderExecutor):
+class EnsembleExecutor(ParslExecutor):
     """Executor that delegates task execution to an EnsembleLauncher cluster.
 
     EnsembleExecutor wraps the ``ensemble_launcher`` package to provide
@@ -68,15 +98,11 @@ class EnsembleExecutor(BlockProviderExecutor):
     connects to) an EnsembleLauncher orchestrator and submits tasks through
     a ``ClusterClient``.
 
-    The executor supports three launch modes:
+    The executor supports two launch modes:
 
-    1. **Provider mode** -- when a ``provider`` is given, configuration files
-       are written to disk and the orchestrator is launched on allocated nodes
-       via the provider. The provider must use exactly one node per block and
-       one block (``nodes_per_block=1``, ``init_blocks=1``, ``max_blocks=1``).
-    2. **In-process mode** -- when no provider is given and ``client_only`` is
-       ``False``, the orchestrator runs inside the current process.
-    3. **Client-only mode** -- when ``client_only`` is ``True``, no
+    1. **In-process mode** -- when ``client_only`` is ``False`` (the default),
+       the orchestrator runs inside the current process.
+    2. **Client-only mode** -- when ``client_only`` is ``True``, no
        orchestrator is started; only a ``ClusterClient`` is created that
        connects to an already-running orchestrator via its checkpoint
        directory.
@@ -154,17 +180,10 @@ class EnsembleExecutor(BlockProviderExecutor):
         ``"fixed_leafs_children_policy"``.
     leaf_nodes : int or None, optional
         Number of leaf nodes in the scheduler tree. Defaults to the number
-        of detected nodes (in-process mode) or ``1`` (provider mode).
+        of detected nodes.
     nchildren : int or None, optional
         Number of children per level in the scheduler tree. Defaults to the
-        number of detected nodes (in-process mode) or ``1`` (provider mode).
-    provider : :class:`~parsl.providers.base.ExecutionProvider` or None, optional
-        Execution provider for allocating compute resources. Must be
-        configured with ``nodes_per_block=1``, ``init_blocks=1``, and
-        ``max_blocks=1``. Default is ``None`` (in-process or client-only
-        mode).
-    block_error_handler : bool or callable, optional
-        Handler for block errors. Default is ``True``.
+        number of detected nodes.
     """
 
     @typeguard.typechecked
@@ -196,8 +215,6 @@ class EnsembleExecutor(BlockProviderExecutor):
         children_scheduler_policy: str = "fixed_leafs_children_policy",
         leaf_nodes: int | None = None,
         nchildren: int | None = None,
-        provider: ExecutionProvider | None = None,
-        block_error_handler: bool | Callable = True,
     ):
         cpus = cpus or list(range(os.cpu_count()))
         gpus = gpus or []
@@ -207,25 +224,8 @@ class EnsembleExecutor(BlockProviderExecutor):
                 "EnsembleExecutor requires the ensemble_launcher package",
             )
 
-        super().__init__(provider=provider, block_error_handler=block_error_handler)
+        super().__init__()
         self.label = label
-
-        if provider is not None:
-            if provider.nodes_per_block != 1:
-                raise ValueError(
-                    f"EnsembleExecutor requires provider.nodes_per_block=1, "
-                    f"got {provider.nodes_per_block}"
-                )
-            if provider.init_blocks != 1:
-                raise ValueError(
-                    f"EnsembleExecutor requires provider.init_blocks=1, "
-                    f"got {provider.init_blocks}"
-                )
-            if provider.max_blocks != 1:
-                raise ValueError(
-                    f"EnsembleExecutor requires provider.max_blocks=1, "
-                    f"got {provider.max_blocks}"
-                )
 
         self._cpus = cpus
         self._gpus = gpus
@@ -243,12 +243,9 @@ class EnsembleExecutor(BlockProviderExecutor):
         self._gpu_selector = gpu_selector
         self._overload_orchestrator_core = overload_orchestrator_core
 
-        if provider is None:
-            self._leaf_nodes = leaf_nodes if leaf_nodes is not None else len(get_nodes())
-            self._nchildren = nchildren if nchildren is not None else len(get_nodes())
-        else:
-            self._leaf_nodes = leaf_nodes if leaf_nodes is not None else 1
-            self._nchildren = nchildren if nchildren is not None else 1
+        n_detected_nodes = len(get_nodes())
+        self._leaf_nodes = leaf_nodes if leaf_nodes is not None else n_detected_nodes
+        self._nchildren = nchildren if nchildren is not None else n_detected_nodes
 
         self._checkpoint_dir_arg = checkpoint_dir
         self._n_workers = n_workers
@@ -262,25 +259,18 @@ class EnsembleExecutor(BlockProviderExecutor):
         self._el: EnsembleLauncher | None = None
         self._client: ClusterClient | None = None
         self._checkpoint_dir: str | None = None
-        self._client_ready: threading.Event | None = None
+        self._tasks: dict[str, Future] = {}
 
     def start(self) -> None:
         """Start the executor and launch the orchestrator.
 
-        Resolves the checkpoint directory, then dispatches to one of three
+        Resolves the checkpoint directory, then dispatches to one of two
         start paths depending on configuration:
 
-        - Provider mode (``provider`` is set): writes config files and
-          launches via the provider.
-        - In-process mode (no provider, ``client_only=False``): starts the
+        - In-process mode (``client_only=False``): starts the
           ``EnsembleLauncher`` in the current process.
         - Client-only mode (``client_only=True``): connects to an
           already-running orchestrator.
-
-        Raises
-        ------
-        OptionalModuleMissing
-            If the ``ensemble_launcher`` package is not installed.
         """
         super().start()
 
@@ -289,30 +279,10 @@ class EnsembleExecutor(BlockProviderExecutor):
         else:
             self._checkpoint_dir = os.path.join(self.run_dir, self.label, "checkpoints")
 
-        if self.provider is not None:
-            self._start_via_provider()
-        elif not self._client_only:
+        if not self._client_only:
             self._start_in_process()
         else:
             self._start_client()
-
-    def _start_via_provider(self) -> None:
-        """Start the orchestrator through the execution provider.
-
-        Writes system and launcher configuration files to disk, spawns a
-        background thread that waits for the orchestrator to become ready
-        and connects a ``ClusterClient``, then triggers provider-based
-        block scaling.
-        """
-        self._setup_config_files()
-
-        self._client_ready = threading.Event()
-        client_thread = threading.Thread(
-            target=self._connect_client, daemon=True, name="EL-Client-Connect"
-        )
-        client_thread.start()
-
-        self.initialize_scaling()
 
     def _start_in_process(self) -> None:
         """Start the ``EnsembleLauncher`` in the current process.
@@ -404,150 +374,6 @@ class EnsembleExecutor(BlockProviderExecutor):
 
         logger.info("ClusterClient started with %d pipeline(s)", self._n_workers)
 
-    def _connect_client(self) -> None:
-        """Connect a ``ClusterClient`` in a background thread.
-
-        Intended to run in a daemon thread during provider-mode startup.
-        Creates and starts a ``ClusterClient``, then signals
-        ``_client_ready`` regardless of success or failure so that
-        ``submit`` does not block indefinitely.
-        """
-        try:
-            self._client = ClusterClient(
-                checkpoint_dir=self._checkpoint_dir,
-                node_id=self._node_id,
-                n_workers=self._n_workers,
-                checkpoint_timeout=self._checkpoint_timeout,
-                task_buffer_size=self._task_buffer_size,
-                task_flush_interval=self._task_flush_interval,
-            )
-            self._client.start()
-            logger.info("ClusterClient connected to orchestrator")
-        except Exception:
-            logger.exception("Failed to connect ClusterClient")
-        finally:
-            self._client_ready.set()
-
-    def _setup_config_files(self) -> None:
-        """Write orchestrator configuration files to disk.
-
-        Creates three files under ``<run_dir>/<label>/el_configs/``:
-
-        - ``system_config.json`` -- CPU/GPU hardware description.
-        - ``launcher_config.json`` -- orchestrator behavioural settings.
-        - ``_launch_el.py`` -- bootstrap script executed by the provider
-          to start the ``EnsembleLauncher`` on the allocated node.
-
-        The paths are stored in ``_system_config_path``,
-        ``_launcher_config_path``, and ``_launch_script_path`` for use by
-        ``_get_launch_command``.
-        """
-        config_dir = os.path.join(self.run_dir, self.label, "el_configs")
-        os.makedirs(config_dir, exist_ok=True)
-
-        sys_config = SystemConfig(
-            name="parsl-el",
-            cpus=self._cpus,
-            gpus=self._gpus,
-            ncpus=len(self._cpus),
-            ngpus=len(self._gpus),
-        )
-
-        launcher_kwargs: dict[str, Any] = {
-            "child_executor_name": self._child_executor_name,
-            "task_executor_name": self._task_executor_name,
-            "comm_name": self._comm_name,
-            "policy_config": PolicyConfig(
-                nlevels=self._nlevels,
-                nchildren=self._nchildren,
-                leaf_nodes=self._leaf_nodes,
-            ),
-            "report_interval": self._report_interval,
-            "return_stdout": self._return_stdout,
-            "worker_logs": self._worker_logs,
-            "master_logs": self._master_logs,
-            "enable_workstealing": self._enable_workstealing,
-            "gpu_selector": self._gpu_selector,
-            "overload_orchestrator_core": self._overload_orchestrator_core,
-            "cluster": True,
-            "checkpoint_dir": self._checkpoint_dir,
-            "log_dir": os.path.join(self.run_dir, self.label, "logs"),
-        }
-        if self._mpi_flavor is not None:
-            launcher_kwargs["mpi_config"] = MPIConfig(flavor=self._mpi_flavor)
-
-        launcher_config = LauncherConfig(**launcher_kwargs)
-
-        self._system_config_path = os.path.join(config_dir, "system_config.json")
-        with open(self._system_config_path, "w") as f:
-            f.write(sys_config.model_dump_json(indent=2))
-
-        self._launcher_config_path = os.path.join(config_dir, "launcher_config.json")
-        with open(self._launcher_config_path, "w") as f:
-            f.write(launcher_config.model_dump_json(indent=2))
-
-        self._launch_script_path = os.path.join(config_dir, "_launch_el.py")
-        with open(self._launch_script_path, "w") as f:
-            f.write(_LAUNCH_SCRIPT_TEMPLATE)
-
-    def initialize_scaling(self) -> None:
-        """Initialize block scaling.
-
-        This is a no-op for ``EnsembleExecutor`` because scaling is
-        managed internally by the ``EnsembleLauncher`` orchestrator.
-        """
-        pass
-
-    def _get_launch_command(self, block_id: str) -> str:
-        """Build the shell command to launch the orchestrator on a block.
-
-        Parameters
-        ----------
-        block_id : str
-            Identifier of the provider block being launched.
-
-        Returns
-        -------
-        str
-            A ``python`` command that runs the bootstrap script with
-            the system and launcher config paths as arguments, and
-            optionally a comma-separated node list.
-        """
-        cmd = f"python {self._launch_script_path} {self._system_config_path} {self._launcher_config_path}"
-        if self._nodes:
-            cmd += f" {','.join(self._nodes)}"
-        return cmd
-
-    def outstanding(self) -> int:
-        """Return the number of tasks that have not yet completed.
-
-        Returns
-        -------
-        int
-            Count of currently tracked (submitted but incomplete) tasks.
-        """
-        return len(self._tasks)
-
-    @property
-    def workers_per_node(self) -> int | float:
-        """int or float: Number of workers per node.
-
-        Always returns ``1`` because worker management is handled
-        internally by the ``EnsembleLauncher`` orchestrator.
-        """
-        return 1
-
-    @property
-    def status_polling_interval(self) -> int:
-        """int: Seconds between status polls.
-
-        Returns the provider's polling interval if a provider is
-        configured, otherwise ``0`` (no polling).
-        """
-        if self.provider is None:
-            return 0
-        return self.provider.status_polling_interval
-
     def submit(
         self,
         func: Callable,
@@ -584,18 +410,13 @@ class EnsembleExecutor(BlockProviderExecutor):
         Raises
         ------
         RuntimeError
-            If the executor is in a bad state, the ``ClusterClient``
-            failed to connect within ``checkpoint_timeout``, or the
-            client is not initialized.
+            If the ``ClusterClient`` is not initialized -- either
+            ``start()`` has not been called, or the executor has already
+            been shut down.
+        InvalidResourceSpecification
+            If ``resource_specification`` contains an unrecognised key or
+            a value of the wrong type.
         """
-        if self.bad_state_is_set:
-            raise self.executor_exception
-
-        if self._client_ready is not None and not self._client_ready.wait(
-            timeout=self._checkpoint_timeout
-        ):
-            raise RuntimeError("ClusterClient failed to connect within timeout")
-
         if self._client is None:
             raise RuntimeError("ClusterClient is not initialized")
 
@@ -628,10 +449,9 @@ class EnsembleExecutor(BlockProviderExecutor):
         """Shut down the executor and release all resources.
 
         Tears down the ``ClusterClient``, stops the ``EnsembleLauncher``
-        (if running in-process), scales in any active provider blocks,
-        and calls the parent ``shutdown``. Exceptions during teardown of
-        individual components are logged but do not prevent the remaining
-        cleanup from executing.
+        (if running in-process), and calls the parent ``shutdown``.
+        Exceptions during teardown of individual components are logged
+        but do not prevent the remaining cleanup from executing.
         """
         if self._client is not None:
             try:
@@ -646,15 +466,6 @@ class EnsembleExecutor(BlockProviderExecutor):
             except Exception:
                 logger.exception("Error during EnsembleLauncher stop")
             self._el = None
-
-        if self.provider is not None:
-            active_blocks = [
-                block_id
-                for block_id, status in self._status.items()
-                if not status.terminal
-            ]
-            if active_blocks:
-                self.scale_in(len(active_blocks))
 
         super().shutdown()
 
@@ -674,15 +485,45 @@ class EnsembleExecutor(BlockProviderExecutor):
     ) -> None:
         """Validate a task's resource specification.
 
+        Checks that every key is recognised and that every value has a
+        type ``ensemble_launcher.ensemble.Task`` will accept, so that a
+        malformed specification is rejected at submit time rather than
+        failing later inside the orchestrator.
+
         Parameters
         ----------
         resource_specification : dict[str, Any] or None
-            The resource specification dictionary to validate. Valid
-            keys are defined in ``_VALID_RESOURCE_SPEC_KEYS``.
+            The resource specification to validate. Recognised keys and
+            their accepted types are defined in
+            ``_RESOURCE_SPEC_VALIDATORS``. ``None`` and the empty dict
+            are accepted and mean "use the defaults".
 
-        Note
-        ----
-        Currently a no-op. Subclasses may override to enforce
-        constraints on allowed keys or value ranges.
+        Raises
+        ------
+        InvalidResourceSpecification
+            If the specification contains an unrecognised key, or a
+            recognised key whose value has the wrong type or is out of
+            range.
         """
-        pass
+        if not resource_specification:
+            return
+
+        invalid_keys = set(resource_specification) - set(_RESOURCE_SPEC_VALIDATORS)
+        if invalid_keys:
+            message = (
+                "EnsembleExecutor only accepts these resource specification "
+                f"keys: {', '.join(sorted(_RESOURCE_SPEC_VALIDATORS))}"
+            )
+            logger.error(message)
+            raise InvalidResourceSpecification(invalid_keys, message)
+
+        bad_values = {}
+        for key, value in resource_specification.items():
+            expected = _RESOURCE_SPEC_VALIDATORS[key](value)
+            if expected is not None:
+                bad_values[key] = f"{key} must be {expected}, got {value!r}"
+
+        if bad_values:
+            message = "; ".join(bad_values[key] for key in sorted(bad_values))
+            logger.error(message)
+            raise InvalidResourceSpecification(set(bad_values), message)
